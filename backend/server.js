@@ -110,6 +110,38 @@ INSTRUCTIONS:
 - Check that all table aliases match the schema exactly
 - Verify all parentheses are balanced and commas are correct`;
 
+// Smaller prompt for slower local models (phi3:mini on CPU, etc.)
+const COMPACT_SCHEMA_CONTEXT = `
+Generate ONLY one MySQL SELECT query (no markdown/explanation).
+
+Schema:
+- user(user_id, username, email, state, country, followers_count)
+- repository(repo_id, repo_name, visibility, created_at, user_id, parent_repo_id)
+- commit_table(commit_id, commit_message, commit_time, lines_added, lines_deleted, repo_id, user_id)
+- programming_language(language_id, language_name)
+- repository_language(repo_id, language_id, usage_percentage)
+- pull_request(pr_id, status, created_at, merged_at, closed_at, repo_id, user_id)
+- repository_stat(repo_id, stars_count, forks_count, recorded_date)
+
+Rules:
+- SELECT only, safe and valid MySQL.
+- Use aliases: u, r, rl, pl, ct, pr, rs.
+- Use LEFT JOINs.
+- Use COALESCE on aggregates.
+- Group by non-aggregated user columns.
+- Return top 50 by computed_score.
+- City mapping: Chennai->Tamil Nadu, Bangalore/Bengaluru->Karnataka, Mumbai->Maharashtra.
+- For Indian places use u.state; countries use u.country.
+`;
+
+const STRICT_RETRY_PROMPT = `
+Return exactly one valid MySQL SELECT statement ending with semicolon.
+No explanation, no markdown, no comments, no extra text.
+Use only these tables: user u, repository r, repository_language rl, programming_language pl, commit_table ct, pull_request pr, repository_stat rs.
+Always use LEFT JOINs and GROUP BY user columns.
+Never use unknown aliases or tables.
+`;
+
 //Ollama Health Check
 async function checkOllamaHealth() {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -135,10 +167,14 @@ async function checkOllamaHealth() {
 async function generateSQLFromOllama(userQuery) {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
   const model = process.env.OLLAMA_MODEL || 'llama3';
+  const ollamaTimeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 120000);
+  const ollamaNumPredict = Number(process.env.OLLAMA_NUM_PREDICT || 160);
+  const ollamaNumCtx = Number(process.env.OLLAMA_NUM_CTX || 1024);
+  const ollamaPromptMode = (process.env.OLLAMA_PROMPT_MODE || 'compact').toLowerCase();
 
-  const prompt = SCHEMA_CONTEXT + `\nUser request: "${userQuery}"\n\nGenerate the query:`;
+  const promptContext = ollamaPromptMode === 'full' ? SCHEMA_CONTEXT : COMPACT_SCHEMA_CONTEXT;
 
-  try {
+  async function callOllama(prompt) {
     const fetchPromise = fetch(`${ollamaUrl}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -146,46 +182,64 @@ async function generateSQLFromOllama(userQuery) {
         model,
         prompt,
         stream: false,
-        options: { 
-          temperature: 0.05,  // Very low for deterministic output
-          top_k: 10,          // Limit token candidates 
-          top_p: 0.5,         // Nucleus sampling
-          num_predict: 1000,  // Reasonable max length
-          num_ctx: 4096       // Context window
+        options: {
+          temperature: 0,
+          top_k: 10,
+          top_p: 0.5,
+          num_predict: ollamaNumPredict,
+          num_ctx: ollamaNumCtx,
+          stop: ['```', '\n\nUser request:', '\n\nExplanation:']
         }
       }),
     });
-    
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Ollama request timeout (30s)')), 30000)
-    );
-    
-    const response = await Promise.race([fetchPromise, timeoutPromise]);
 
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Ollama request timeout (${Math.round(ollamaTimeoutMs / 1000)}s)`)), ollamaTimeoutMs)
+    );
+
+    const response = await Promise.race([fetchPromise, timeoutPromise]);
     if (!response.ok) {
       throw new Error(`Ollama request failed: ${response.status} ${response.statusText}`);
     }
 
     const data = await response.json();
-    let sql = data.response.trim();
+    return (data.response || '').trim();
+  }
 
-    // Aggressive cleanup
-    sql = sql.replace(/```sql\n?/gi, '').replace(/```\n?/g, '').trim();
+  function extractSql(rawText) {
+    let sql = (rawText || '')
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/```sql\n?/gi, '')
+      .replace(/```\n?/g, '')
+      .trim();
 
-    // Extract SELECT statement robustly
-    const sqlMatch = sql.match(/SELECT[\s\S]+/i);
-    if (!sqlMatch) throw new Error('No SELECT statement found in Ollama response');
-    sql = sqlMatch[0].trim().replace(/;?\s*$/, ';');
+    const startIndex = sql.search(/\b(SELECT|WITH)\b/i);
+    if (startIndex === -1) return null;
+    sql = sql.slice(startIndex).trim();
 
-    // Safety: only allow SELECT statements
-    if (!sql.toUpperCase().startsWith('SELECT')) {
-      throw new Error('Generated query is not a SELECT statement.');
-    }
-    if (/SELECT\s+.*\s+INTO\s+/i.test(sql)) {
-      throw new Error('Unsafe SELECT INTO query rejected.');
-    }
+    const firstStatement = sql.split(';').find((s) => s && s.trim().length > 0);
+    if (!firstStatement) return null;
 
+    sql = firstStatement.trim().replace(/;?\s*$/, ';');
+
+    if (!/^(SELECT|WITH)\b/i.test(sql)) return null;
+    if (/SELECT\s+.*\s+INTO\s+/i.test(sql)) return null;
     return sql;
+  }
+
+  try {
+    const basePrompt = `${promptContext}\nUser request: "${userQuery}"\n\nGenerate the query:`;
+    const firstRaw = await callOllama(basePrompt);
+    const firstSql = extractSql(firstRaw);
+    if (firstSql && isValidSQL(firstSql)) return firstSql;
+
+    // Retry once with a stricter, shorter prompt for weaker models.
+    const retryPrompt = `${STRICT_RETRY_PROMPT}\nUser request: "${userQuery}"\nSQL:`;
+    const retryRaw = await callOllama(retryPrompt);
+    const retrySql = extractSql(retryRaw);
+    if (retrySql && isValidSQL(retrySql)) return retrySql;
+
+    throw new Error('No valid SQL after strict retry');
   } catch (err) {
     throw new Error(`Ollama connection failed: ${err.message}`);
   }
@@ -197,13 +251,22 @@ function isValidSQL(sql) {
   
   const trimmed = sql.trim().toUpperCase();
 
-  if (!trimmed.startsWith('SELECT')) return false;
+  if (!(trimmed.startsWith('SELECT') || trimmed.startsWith('WITH'))) return false;
 
-  if (!sql.toUpperCase().includes('FROM')) return false;
+  if (!/\bSELECT\b/i.test(sql) || !/\bFROM\b/i.test(sql)) return false;
 
-  if (/DROP\s+TABLE|DELETE\s+FROM|UPDATE\s+|TRUNCATE|INSERT\s+INTO/i.test(sql)) {
+  if (/\bDROP\s+TABLE\b|\bDELETE\s+FROM\b|\bUPDATE\s+\w+\b|\bTRUNCATE\b|\bINSERT\s+INTO\b/i.test(sql)) {
     return false;
   }
+
+  // Basic malformed SQL guardrails for weak local models.
+  const deEscaped = sql.replace(/''/g, '');
+  const singleQuotes = (deEscaped.match(/'/g) || []).length;
+  if (singleQuotes % 2 !== 0) return false;
+
+  const openParens = (sql.match(/\(/g) || []).length;
+  const closeParens = (sql.match(/\)/g) || []).length;
+  if (openParens !== closeParens) return false;
 
   if (sql.length > 10000) return false;
 
@@ -250,9 +313,9 @@ function getFallbackQuery(userQuery) {
   // Define countries
   const countries = {
     'india': 'India',
-    'usa': 'USA',
-    'united states': 'USA',
-    'us': 'USA',
+    'usa': 'United States of America',
+    'united states': 'United States of America',
+    'us': 'United States of America',
     'uk': 'UK',
     'united kingdom': 'UK',
     'canada': 'Canada',
@@ -333,6 +396,20 @@ function getFallbackQuery(userQuery) {
     ORDER BY computed_score DESC
     LIMIT 50
   `;
+}
+
+function shouldUseFallbackImmediately(userQuery) {
+  const q = (userQuery || '').toLowerCase();
+
+  // Fast-path common simple lookups to avoid waiting on slow local models.
+  const simpleLocationQuery =
+    /(developers?|engineers?|coders?).*(from|in)\s+[a-z\s]+/.test(q) ||
+    /(from|in)\s+(india|usa|united states|us|uk|canada|australia|germany|france|japan|china|singapore|uae)/.test(q);
+
+  const simpleLanguageQuery =
+    /(developers?|engineers?).*(python|javascript|typescript|java|go|rust|c\+\+|php|ruby|c#|swift|kotlin|r)\b/.test(q);
+
+  return simpleLocationQuery || simpleLanguageQuery;
 }
 
 //Routes 
@@ -450,19 +527,32 @@ app.post('/api/search', async (req, res) => {
   let generatedSQL = null;
   let usedFallback = false;
   let ollamaError = null;
+  const ollamaMode = (process.env.OLLAMA_MODE || 'auto').toLowerCase();
+  const fastPathEnabled = (process.env.OLLAMA_FAST_PATH || 'true').toLowerCase() !== 'false';
+  const forceFastPath = fastPathEnabled && shouldUseFallbackImmediately(query);
 
-  // Ollama
-  try {
-    generatedSQL = await generateSQLFromOllama(query);
-    // Validate the generated SQL
-    if (!isValidSQL(generatedSQL)) {
-      throw new Error('Generated SQL failed validation checks');
-    }
-  } catch (err) {
-    ollamaError = err.message;
-    console.warn('Ollama unavailable or invalid, using fallback:', err.message);
+  // Optional fast-path / disable switch for slow local inference.
+  if (ollamaMode === 'off' || forceFastPath) {
     generatedSQL = getFallbackQuery(query);
     usedFallback = true;
+    if (ollamaMode === 'off') {
+      ollamaError = 'Ollama disabled by OLLAMA_MODE=off';
+    } else {
+      ollamaError = 'Using fast fallback for simple query';
+    }
+  } else {
+    // Ollama
+    try {
+      generatedSQL = await generateSQLFromOllama(query);
+      if (!isValidSQL(generatedSQL)) {
+        throw new Error('AI SQL malformed (auto-fallback)');
+      }
+    } catch (err) {
+      ollamaError = err.message;
+      console.warn('Ollama unavailable or invalid, using fallback:', err.message);
+      generatedSQL = getFallbackQuery(query);
+      usedFallback = true;
+    }
   }
 
   // Execute the SQL
